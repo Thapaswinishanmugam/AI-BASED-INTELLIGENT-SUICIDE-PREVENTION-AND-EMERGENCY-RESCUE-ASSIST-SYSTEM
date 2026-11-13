@@ -1,0 +1,1340 @@
+import os
+import sys
+import time
+import datetime
+from collections import deque
+import threading
+import random
+import tkinter as tk
+from tkinter import messagebox
+
+import customtkinter as ctk
+
+# Check if serial is available
+try:
+    import serial
+    import serial.tools.list_ports
+    HAS_SERIAL = True
+except ImportError:
+    HAS_SERIAL = False
+
+# ==============================================================================
+# Application Theme & Color Palette
+# ==============================================================================
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+COLOR_BG = "#0b1120"           # Deep space slate
+COLOR_CARD = "#1e293b"         # Slate 800
+COLOR_CARD_BORDER = "#334155"  # Slate 700
+COLOR_NORMAL = "#10b981"      # Emerald 500 (Safe)
+COLOR_WARN = "#f59e0b"        # Amber 500 (Caution / Person Detect)
+COLOR_DANGER = "#ef4444"      # Red 500 (Critical Hazard / Abnormal / SD Attempt)
+COLOR_ACCENT = "#38bdf8"      # Sky Blue 400
+COLOR_PURPLE = "#a855f7"      # Purple 500
+COLOR_TEXT = "#f8fafc"        # Slate 50
+COLOR_TEXT_MUTED = "#94a3b8"  # Slate 400
+COLOR_PANEL_SAFE = "#064e3b"  # Emerald 900
+COLOR_PANEL_WARN = "#78350f"  # Amber 900
+COLOR_PANEL_DANGER = "#7f1d1d"# Red 900
+
+
+# ==============================================================================
+# Evaluator & Logic Engine
+# ==============================================================================
+class RakshaEvaluator:
+    """
+    Evaluates sensor telemetry for the RakshaFan system according to Arduino thresholds:
+      - Distance < 20 cm                 -> PERSON_DETECT
+      - Accelerometer X > 7 or < -7      -> FAN_ABNORMAL
+      - Units (Weight) > 1000 & Dist < 20 -> SUICIDE_ATTEMPT
+      - Otherwise                        -> NORMAL
+    Also detects and lists WHICH individual parameters are abnormal.
+    """
+    WEIGHT_THRESHOLD = 1000.0     # units (grams/load threshold)
+    DISTANCE_THRESHOLD = 20.0    # cm
+    ACCEL_X_THRESHOLD = 7.0      # m/s^2 (safe range [-7, 7])
+
+    @classmethod
+    def evaluate(cls, weight: float, distance: float, accel_x: float, raw_status: str = ""):
+        abnormalities = []
+
+        # 1. Check Weight
+        is_weight_abnormal = weight > cls.WEIGHT_THRESHOLD
+        if is_weight_abnormal:
+            abnormalities.append({
+                "param": "Weight",
+                "current": f"{weight:.1f} units",
+                "limit": f"> {cls.WEIGHT_THRESHOLD:.0f} units",
+                "reason": f"Excessive load ({weight:.1f} > {cls.WEIGHT_THRESHOLD:.0f} units) detected on fan rod/blades"
+            })
+
+        # 2. Check Distance
+        is_distance_abnormal = distance < cls.DISTANCE_THRESHOLD
+        if is_distance_abnormal:
+            abnormalities.append({
+                "param": "Distance",
+                "current": f"{distance:.1f} cm",
+                "limit": f"< {cls.DISTANCE_THRESHOLD:.0f} cm",
+                "reason": f"Person or obstacle within close proximity ({distance:.1f} < {cls.DISTANCE_THRESHOLD:.0f} cm)"
+            })
+
+        # 3. Check Accelerometer X
+        is_accel_abnormal = (accel_x > cls.ACCEL_X_THRESHOLD) or (accel_x < -cls.ACCEL_X_THRESHOLD)
+        if is_accel_abnormal:
+            abnormalities.append({
+                "param": "Accelerometer X",
+                "current": f"{accel_x:+.2f} m/s²",
+                "limit": f"|X| > {cls.ACCEL_X_THRESHOLD:.1f} m/s²",
+                "reason": f"Severe vibration / wobble ({accel_x:+.2f} m/s² exceeds safe band ±{cls.ACCEL_X_THRESHOLD:.1f})"
+            })
+
+        # Overall System Diagnosis & Priority:
+        # Suicide / Sudden-Drop Attempt takes highest priority
+        if is_weight_abnormal and is_distance_abnormal:
+            diagnosis = "SUICIDE_ATTEMPT"
+            severity = "CRITICAL"
+            headline = "CRITICAL: SUICIDE / SUDDEN DROP ATTEMPT DETECTED!"
+            color = COLOR_DANGER
+            action = "EMERGENCY: Cutting fan power relay & sounding audible alarm buzzer immediately!"
+        elif is_weight_abnormal:
+            diagnosis = "SUICIDE_ATTEMPT"
+            severity = "CRITICAL"
+            headline = "CRITICAL: EXTREME DOWNWARD LOAD DETECTED ON FAN!"
+            color = COLOR_DANGER
+            action = "EMERGENCY: Weight exceeds 1000 units safety limit. Fan motor shutdown triggered!"
+        elif is_accel_abnormal:
+            diagnosis = "FAN_ABNORMAL"
+            severity = "WARNING"
+            headline = "WARNING: ABNORMAL FAN WOBBLE / BLADE IMBALANCE!"
+            color = COLOR_DANGER
+            action = "MAINTENANCE: High vibration detected. Inspect fan mounting, downrod, and blade balance!"
+        elif is_distance_abnormal:
+            diagnosis = "PERSON_DETECT"
+            severity = "CAUTION"
+            headline = "CAUTION: PERSON DETECTED IN PROXIMITY UNDER FAN"
+            color = COLOR_WARN
+            action = "SAFETY: Proximity sensor triggered (< 20 cm). Monitoring for load or movement changes."
+        else:
+            diagnosis = "NORMAL"
+            severity = "NORMAL"
+            headline = "ALL SENSORS NORMAL & FAN OPERATING SAFELY"
+            color = COLOR_NORMAL
+            action = "System idle: Fan running under normal operating conditions."
+
+        # If Arduino transmitted a specific recognized status, report it
+        normalized_raw = raw_status.strip().upper()
+
+        return {
+            "weight": weight,
+            "distance": distance,
+            "accel_x": accel_x,
+            "raw_status": raw_status,
+            "is_weight_abnormal": is_weight_abnormal,
+            "is_distance_abnormal": is_distance_abnormal,
+            "is_accel_abnormal": is_accel_abnormal,
+            "has_abnormal": len(abnormalities) > 0,
+            "abnormalities": abnormalities,
+            "diagnosis": diagnosis,
+            "severity": severity,
+            "headline": headline,
+            "color": color,
+            "action": action
+        }
+
+
+# ==============================================================================
+# Serial Communication & Hardware Simulation Handler
+# ==============================================================================
+class SerialManager:
+    """Manages real serial port communication and realistic virtual fan telemetry."""
+    def __init__(self, on_packet_callback, on_log_callback, on_state_callback):
+        self.on_packet = on_packet_callback
+        self.on_log = on_log_callback
+        self.on_state = on_state_callback
+
+        self.serial_inst = None
+        self.is_connected = False
+        self.is_simulating = False
+        self.sim_mode = "Auto Cycle"
+
+        self._read_thread = None
+        self._sim_thread = None
+        self._stop_event = threading.Event()
+
+    @staticmethod
+    def get_available_ports():
+        if not HAS_SERIAL:
+            return ["No Serial Library"]
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        return ports if ports else ["No Ports Detected"]
+
+    def connect(self, port: str, baud: int = 9600):
+        if not HAS_SERIAL:
+            return False, "pyserial library is not installed."
+        if self.is_simulating:
+            self.stop_simulation()
+
+        try:
+            self.serial_inst = serial.Serial(port, baud, timeout=1.0)
+            self.is_connected = True
+            self._stop_event.clear()
+            self._read_thread = threading.Thread(target=self._serial_read_worker, daemon=True)
+            self._read_thread.start()
+            self.on_state(True, f"Connected to {port} @ {baud}")
+            self.on_log(f"Successfully connected to serial port: {port} ({baud} baud)", "SUCCESS")
+            return True, "Connected"
+        except Exception as e:
+            self.is_connected = False
+            self.on_state(False, "Disconnected")
+            return False, str(e)
+
+    def disconnect(self):
+        self._stop_event.set()
+        if self.serial_inst and self.serial_inst.is_open:
+            try:
+                self.serial_inst.close()
+            except Exception:
+                pass
+        self.is_connected = False
+        self.is_simulating = False
+        self.on_state(False, "Disconnected")
+        self.on_log("Serial / Simulator stopped.", "INFO")
+
+    def start_simulation(self, mode="Auto Cycle"):
+        if self.is_connected:
+            self.disconnect()
+
+        self.sim_mode = mode
+        self.is_simulating = True
+        self._stop_event.clear()
+        self._sim_thread = threading.Thread(target=self._sim_worker, daemon=True)
+        self._sim_thread.start()
+        self.on_state(True, f"Simulation: {mode}")
+        self.on_log(f"Started hardware simulator in mode: {mode}", "INFO")
+
+    def stop_simulation(self):
+        self._stop_event.set()
+        self.is_simulating = False
+        self.on_state(False, "Disconnected")
+        self.on_log("Simulator stopped.", "INFO")
+
+    def set_simulation_mode(self, mode):
+        self.sim_mode = mode
+        if self.is_simulating:
+            self.on_state(True, f"Simulation: {mode}")
+            self.on_log(f"Simulation scenario switched to: {mode}", "INFO")
+
+    def _serial_read_worker(self):
+        buf = ""
+        while not self._stop_event.is_set():
+            try:
+                if self.serial_inst and self.serial_inst.in_waiting:
+                    raw_bytes = self.serial_inst.readline()
+                    raw_line = raw_bytes.decode("utf-8", errors="replace").strip()
+                    if raw_line:
+                        self._process_incoming_line(raw_line)
+                else:
+                    time.sleep(0.02)
+            except Exception as e:
+                self.on_log(f"Serial read error: {e}", "ERROR")
+                break
+        self.is_connected = False
+        self.on_state(False, "Disconnected")
+
+    def _sim_worker(self):
+        step = 0
+        while not self._stop_event.is_set():
+            mode = self.sim_mode
+            if mode == "Auto Cycle":
+                # Cycle every 8 seconds through different realistic states
+                cycle_idx = (step // 16) % 4
+                if cycle_idx == 0:
+                    current_mode = "Normal"
+                elif cycle_idx == 1:
+                    current_mode = "Person Detect"
+                elif cycle_idx == 2:
+                    current_mode = "Fan Abnormal"
+                else:
+                    current_mode = "Suicide Attempt"
+            else:
+                current_mode = mode
+
+            # Generate realistic sensor values based on scenario
+            if current_mode in ("Normal", "Normal (Safe Operation)"):
+                w = round(random.uniform(0.5, 5.0), 1)
+                d = round(random.uniform(35.0, 65.0), 1)
+                ax = round(random.uniform(-1.5, 1.5), 1)
+                st = "NORMAL"
+            elif current_mode in ("Person Detect", "Person Detected (< 20 cm)"):
+                w = round(random.uniform(1.0, 4.0), 1)
+                d = round(random.uniform(9.0, 18.5), 1)
+                ax = round(random.uniform(-1.2, 1.2), 1)
+                st = "PERSON_DETECT"
+            elif current_mode in ("Fan Abnormal", "Fan Abnormal Wobble (|X| > 7)"):
+                w = round(random.uniform(2.0, 8.0), 1)
+                d = round(random.uniform(40.0, 60.0), 1)
+                sign = random.choice([1, -1])
+                ax = round(sign * random.uniform(7.8, 11.5), 1)
+                st = "FAN_ABNORMAL"
+            elif current_mode in ("Suicide Attempt", "Suicide Attempt (> 1000 & < 20)"):
+                w = round(random.uniform(1150.0, 1650.0), 1)
+                d = round(random.uniform(8.0, 17.0), 1)
+                ax = round(random.uniform(-2.5, 3.5), 1)
+                st = "SUICIDE_ATTEMPT"
+            elif current_mode in ("Heavy Load Only", "Heavy Load Only (> 1000)"):
+                w = round(random.uniform(1100.0, 1400.0), 1)
+                d = round(random.uniform(35.0, 50.0), 1)
+                ax = round(random.uniform(-1.0, 1.0), 1)
+                st = "SUICIDE_ATTEMPT"
+            else:
+                w, d, ax, st = 2.0, 45.0, 0.5, "NORMAL"
+
+            # Format matching Arduino: Weight,Distance,Accelerometerx,Status
+            line = f"{w},{d},{ax},{st}"
+            self._process_incoming_line(line)
+
+            step += 1
+            time.sleep(0.5)
+
+    def _process_incoming_line(self, line: str):
+        line = line.strip()
+        if not line:
+            return
+
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) >= 3:
+            try:
+                def clean_float(token):
+                    # Clean out prefixes if Arduino sends something like "W:2"
+                    if ":" in token:
+                        token = token.split(":")[-1]
+                    return float(token.strip())
+
+                weight = clean_float(parts[0])
+                distance = clean_float(parts[1])
+                accel_x = clean_float(parts[2])
+                status = parts[3].strip() if len(parts) > 3 else "NORMAL"
+
+                parsed = {
+                    "raw": line,
+                    "weight": weight,
+                    "distance": distance,
+                    "accel_x": accel_x,
+                    "status": status,
+                    "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
+                }
+                self.on_packet(parsed)
+            except ValueError:
+                self.on_log(f"Unrecognized serial format: '{line}'", "WARN")
+        else:
+            self.on_log(f"Raw Arduino message: {line}", "INFO")
+
+
+# ==============================================================================
+# Native Tkinter Canvas Real-Time Strip Chart (Zero Matplotlib Dependency)
+# ==============================================================================
+class TkStripChart(tk.Canvas):
+    """
+    High-performance real-time strip chart rendered on native Tkinter Canvas.
+    Supports dashed threshold lines, dynamic grid, current value tag, and smooth traces.
+    """
+    def __init__(self, parent, title="CHART", unit="", min_val=0, max_val=100,
+                 line_color="#38bdf8", thresholds=None, height=150, **kwargs):
+        super().__init__(
+            parent,
+            bg="#0f172a",
+            highlightthickness=1,
+            highlightbackground="#334155",
+            height=height,
+            **kwargs
+        )
+        self.title = title
+        self.unit = unit
+        self.min_val = min_val
+        self.max_val = max_val
+        self.line_color = line_color
+        self.thresholds = thresholds or []  # List of tuples: (val, color, label)
+        self.history = deque(maxlen=35)
+
+        self.bind("<Configure>", lambda e: self.redraw())
+
+    def add_point(self, val: float):
+        self.history.append(val)
+        self.redraw()
+
+    def redraw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 60 or h <= 40:
+            w = max(w, 280)
+            h = max(h, 140)
+
+        pad_left, pad_right, pad_top, pad_bottom = 50, 16, 26, 20
+        plot_w = max(20, w - pad_left - pad_right)
+        plot_h = max(20, h - pad_top - pad_bottom)
+
+        # Plot Title (Top Left)
+        self.create_text(
+            pad_left, 12,
+            text=self.title,
+            fill="#cbd5e1",
+            font=("Helvetica", 10, "bold"),
+            anchor="w"
+        )
+
+        current_vals = list(self.history)
+        y_min = self.min_val
+        y_max = self.max_val
+        if current_vals:
+            y_min = min(y_min, min(current_vals))
+            y_max = max(y_max, max(current_vals))
+        if y_max <= y_min:
+            y_max = y_min + 1.0
+
+        # Draw 3 Horizontal Grid Lines & Y-Axis Scale
+        for frac in [0.0, 0.5, 1.0]:
+            y_coord = pad_top + plot_h * (1.0 - frac)
+            val = y_min + (y_max - y_min) * frac
+            self.create_line(pad_left, y_coord, pad_left + plot_w, y_coord, fill="#1e293b", dash=(3, 3))
+            self.create_text(
+                pad_left - 6, y_coord,
+                text=f"{val:.0f}",
+                fill="#64748b",
+                font=("Helvetica", 8),
+                anchor="e"
+            )
+
+        # Draw Safety Threshold Reference Lines
+        for th_val, th_col, th_lbl in self.thresholds:
+            if y_min <= th_val <= y_max:
+                norm_th = (th_val - y_min) / (y_max - y_min)
+                y_coord = pad_top + plot_h * (1.0 - norm_th)
+                self.create_line(
+                    pad_left, y_coord, pad_left + plot_w, y_coord,
+                    fill=th_col, dash=(4, 3), width=1
+                )
+                self.create_text(
+                    pad_left + plot_w - 4, y_coord - 7,
+                    text=th_lbl,
+                    fill=th_col,
+                    font=("Helvetica", 8, "bold"),
+                    anchor="e"
+                )
+
+        # Draw Line Graph & Data Points
+        if len(current_vals) >= 2:
+            pts = []
+            max_slots = self.history.maxlen - 1
+            for i, val in enumerate(current_vals):
+                x = pad_left + (i / max(1, max_slots)) * plot_w
+                norm_y = (val - y_min) / (y_max - y_min)
+                y = pad_top + plot_h * (1.0 - norm_y)
+                pts.extend([x, y])
+
+            # Draw trace line
+            self.create_line(*pts, fill=self.line_color, width=2)
+
+            # Draw point dots
+            for i in range(0, len(pts), 2):
+                px, py = pts[i], pts[i + 1]
+                self.create_oval(px - 2, py - 2, px + 2, py + 2, fill=self.line_color, outline="")
+
+            # Glow on latest point
+            lx, ly = pts[-2], pts[-1]
+            self.create_oval(lx - 4, ly - 4, lx + 4, ly + 4, fill=self.line_color, outline="#ffffff", width=1)
+
+            # Current Live Value Tag (Top Right)
+            latest_val = current_vals[-1]
+            self.create_text(
+                pad_left + plot_w, 12,
+                text=f"{latest_val:.1f} {self.unit}".strip(),
+                fill=self.line_color,
+                font=("Helvetica", 10, "bold"),
+                anchor="e"
+            )
+
+
+# ==============================================================================
+# Main RakshaFan Desktop Application Window
+# ==============================================================================
+class RakshaFanApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("🛡️ RakshaFan - Smart Ceiling Fan Safety & Anomaly Monitoring System")
+        self.geometry("1340x880")
+        self.minsize(1050, 750)
+        self.configure(fg_color=COLOR_BG)
+
+        # Thread-safe buffer
+        self.data_lock = threading.Lock()
+        self.latest_packet = None
+        self.latest_eval = None
+
+        # Telemetry statistics
+        self.stats = {
+            "total_packets": 0,
+            "normal": 0,
+            "person_detect": 0,
+            "fan_abnormal": 0,
+            "SUICIDE_ATTEMPT": 0
+        }
+
+        # Initialize Serial & Simulation Handler
+        self.serial_manager = SerialManager(
+            on_packet_callback=self._on_packet_received_thread,
+            on_log_callback=self._on_log_thread,
+            on_state_callback=self._on_state_change_thread
+        )
+
+        self._build_ui()
+
+        # GUI tick timer (runs every 200ms in main thread)
+        self.after(200, self._periodic_gui_tick)
+
+        # Clean exit handler
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _build_ui(self):
+        # ----------------------------------------------------------------------
+        # 1. Top Header Bar
+        # ----------------------------------------------------------------------
+        header = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=12, border_width=1, border_color=COLOR_CARD_BORDER)
+        header.pack(fill="x", padx=16, pady=(12, 6))
+
+        # Title block
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.pack(side="left", padx=16, pady=10)
+
+        title_lbl = ctk.CTkLabel(
+            title_box,
+            text="🛡️ RAKSHAFAN — SMART CEILING FAN SAFETY & ANOMALY MONITOR",
+            font=ctk.CTkFont(family="Helvetica", size=18, weight="bold"),
+            text_color="#38bdf8"
+        )
+        title_lbl.pack(anchor="w")
+
+        sub_lbl = ctk.CTkLabel(
+            title_box,
+            text="Real-time Anti-Suicide & Anomaly Detection • Load Cell (Weight) • Ultrasonic (Distance) • Accelerometer (X)",
+            font=ctk.CTkFont(family="Helvetica", size=12),
+            text_color=COLOR_TEXT_MUTED
+        )
+        sub_lbl.pack(anchor="w")
+
+        # Status badge & Mute/Reset buttons
+        right_box = ctk.CTkFrame(header, fg_color="transparent")
+        right_box.pack(side="right", padx=16, pady=10)
+
+        self.status_badge = ctk.CTkLabel(
+            right_box,
+            text="● SYSTEM DISCONNECTED",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=COLOR_TEXT_MUTED,
+            fg_color="#334155",
+            corner_radius=8,
+            padx=12,
+            pady=6
+        )
+        self.status_badge.pack(side="right", padx=(8, 0))
+
+        reset_btn = ctk.CTkButton(
+            right_box,
+            text="↺ Reset Counters",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="#334155",
+            hover_color="#475569",
+            width=120,
+            height=32,
+            command=self._reset_stats
+        )
+        reset_btn.pack(side="right")
+
+        # ----------------------------------------------------------------------
+        # 2. Serial & Hardware Simulator Toolbar
+        # ----------------------------------------------------------------------
+        ctrl_frame = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=12, border_width=1, border_color=COLOR_CARD_BORDER)
+        ctrl_frame.pack(fill="x", padx=16, pady=4)
+
+        # Hardware Serial Controls
+        serial_box = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
+        serial_box.pack(side="left", padx=12, pady=8)
+
+        ctk.CTkLabel(serial_box, text="Serial Port:", font=ctk.CTkFont(size=12, weight="bold"), text_color=COLOR_TEXT).pack(side="left", padx=(0, 6))
+
+        ports = SerialManager.get_available_ports()
+        self.port_combo = ctk.CTkComboBox(serial_box, values=ports, width=170, font=ctk.CTkFont(size=12))
+        self.port_combo.pack(side="left", padx=4)
+        if ports:
+            self.port_combo.set(ports[0])
+
+        refresh_btn = ctk.CTkButton(
+            serial_box,
+            text="🔄",
+            width=36,
+            height=30,
+            fg_color="#334155",
+            hover_color="#475569",
+            command=self._refresh_ports
+        )
+        refresh_btn.pack(side="left", padx=4)
+
+        ctk.CTkLabel(serial_box, text="Baud:", font=ctk.CTkFont(size=12, weight="bold"), text_color=COLOR_TEXT).pack(side="left", padx=(10, 6))
+        self.baud_combo = ctk.CTkComboBox(serial_box, values=["9600", "115200", "57600", "19200"], width=95, font=ctk.CTkFont(size=12))
+        self.baud_combo.set("9600")
+        self.baud_combo.pack(side="left", padx=4)
+
+        self.connect_btn = ctk.CTkButton(
+            serial_box,
+            text="🔌 Connect Arduino",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#2563eb",
+            hover_color="#1d4ed8",
+            width=140,
+            height=32,
+            command=self._toggle_connection
+        )
+        self.connect_btn.pack(side="left", padx=10)
+
+        # Simulator Controls (Virtual Fan Hardware Demo)
+        sim_box = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
+        sim_box.pack(side="right", padx=12, pady=8)
+
+        ctk.CTkLabel(sim_box, text="Virtual Fan Demo:", font=ctk.CTkFont(size=12, weight="bold"), text_color=COLOR_ACCENT).pack(side="left", padx=(0, 6))
+
+        self.sim_combo = ctk.CTkComboBox(
+            sim_box,
+            values=[
+                "Auto Cycle",
+                "Normal (Safe Operation)",
+                "Person Detected (< 20 cm)",
+                "Fan Abnormal Wobble (|X| > 7)",
+                "Suicide Attempt (> 1000 & < 20)",
+                "Heavy Load Only (> 1000)"
+            ],
+            width=180,
+            font=ctk.CTkFont(size=12),
+            command=self._on_sim_mode_changed
+        )
+        self.sim_combo.set("Auto Cycle")
+        self.sim_combo.pack(side="left", padx=4)
+
+        self.sim_btn = ctk.CTkButton(
+            sim_box,
+            text="▶ Start Simulation",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            fg_color="#059669",
+            hover_color="#047857",
+            width=135,
+            height=32,
+            command=self._toggle_simulation
+        )
+        self.sim_btn.pack(side="left", padx=4)
+
+        # ----------------------------------------------------------------------
+        # 3. Telemetry Parameter Cards Grid (4 Cards)
+        # ----------------------------------------------------------------------
+        cards_grid = ctk.CTkFrame(self, fg_color="transparent")
+        cards_grid.pack(fill="x", padx=16, pady=4)
+        cards_grid.grid_columnconfigure((0, 1, 2, 3), weight=1, uniform="param_card")
+
+        # Card 1: Weight / Load Cell
+        self.card_weight = self._create_parameter_card(
+            parent=cards_grid,
+            col=0,
+            icon="⚖️",
+            title="WEIGHT (LOAD CELL)",
+            unit="units",
+            init_val="--.-",
+            threshold_text="Threshold: <= 1000 units",
+            max_gauge=1500.0
+        )
+
+        # Card 2: Distance / Ultrasonic Proximity
+        self.card_distance = self._create_parameter_card(
+            parent=cards_grid,
+            col=1,
+            icon="📏",
+            title="DISTANCE (PROXIMITY)",
+            unit="cm",
+            init_val="--.-",
+            threshold_text="Safe: >= 20 cm",
+            max_gauge=100.0
+        )
+
+        # Card 3: Accelerometer X / Fan Wobble
+        self.card_accel = self._create_parameter_card(
+            parent=cards_grid,
+            col=2,
+            icon="📳",
+            title="ACCELEROMETER X",
+            unit="m/s²",
+            init_val="--.-",
+            threshold_text="Safe: -7.0 to +7.0 m/s²",
+            max_gauge=15.0
+        )
+
+        # Card 4: Arduino State / System Diagnosis
+        self.card_status = self._create_status_card(
+            parent=cards_grid,
+            col=3
+        )
+
+        # ----------------------------------------------------------------------
+        # 4. Prominent "Which Value is Abnormal" Diagnostic Breakdown Panel
+        # ----------------------------------------------------------------------
+        self.diag_panel = ctk.CTkFrame(
+            self,
+            fg_color=COLOR_CARD,
+            corner_radius=12,
+            border_width=2,
+            border_color=COLOR_CARD_BORDER
+        )
+        self.diag_panel.pack(fill="x", padx=16, pady=6)
+
+        diag_content = ctk.CTkFrame(self.diag_panel, fg_color="transparent")
+        diag_content.pack(fill="x", padx=16, pady=12)
+
+        # Header with badge and headline
+        top_line = ctk.CTkFrame(diag_content, fg_color="transparent")
+        top_line.pack(fill="x")
+
+        self.diag_headline = ctk.CTkLabel(
+            top_line,
+            text="WAITING FOR SENSOR TELEMETRY...",
+            font=ctk.CTkFont(family="Helvetica", size=16, weight="bold"),
+            text_color="#94a3b8"
+        )
+        self.diag_headline.pack(side="left")
+
+        self.diag_severity_badge = ctk.CTkLabel(
+            top_line,
+            text="STATUS: STANDBY",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#ffffff",
+            fg_color="#334155",
+            corner_radius=6,
+            padx=10,
+            pady=3
+        )
+        self.diag_severity_badge.pack(side="right")
+
+        # Specific Abnormal Values Breakdown Row
+        self.abnormal_breakdown_label = ctk.CTkLabel(
+            diag_content,
+            text="No abnormal values detected. Fan is operating within safety thresholds.",
+            font=ctk.CTkFont(family="Helvetica", size=13),
+            text_color=COLOR_TEXT_MUTED,
+            justify="left",
+            wraplength=1250
+        )
+        self.abnormal_breakdown_label.pack(anchor="w", pady=(6, 2))
+
+        # Recommended Action / Directive
+        self.diag_action_label = ctk.CTkLabel(
+            diag_content,
+            text="System ready: Connect serial port or launch Virtual Fan Demo.",
+            font=ctk.CTkFont(family="Helvetica", size=11, weight="bold"),
+            text_color="#64748b",
+            justify="left"
+        )
+        self.diag_action_label.pack(anchor="w")
+
+        # ----------------------------------------------------------------------
+        # 5. Real-Time Strip Charts (Weight, Distance, Accelerometer X)
+        # ----------------------------------------------------------------------
+        charts_container = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=12, border_width=1, border_color=COLOR_CARD_BORDER)
+        charts_container.pack(fill="both", expand=True, padx=16, pady=(4, 6))
+
+        charts_hdr = ctk.CTkFrame(charts_container, fg_color="transparent")
+        charts_hdr.pack(fill="x", padx=12, pady=(8, 4))
+
+        ctk.CTkLabel(
+            charts_hdr,
+            text="LIVE SENSOR STRIP CHARTS WITH SAFETY THRESHOLDS (REAL-TIME TIME-SERIES)",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=COLOR_TEXT_MUTED
+        ).pack(side="left")
+
+        # 3 Charts Grid
+        charts_grid = ctk.CTkFrame(charts_container, fg_color="transparent")
+        charts_grid.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        charts_grid.grid_columnconfigure((0, 1, 2), weight=1, uniform="chart_col")
+
+        # Chart 1: Weight History
+        self.chart_weight = TkStripChart(
+            charts_grid,
+            title="WEIGHT / LOAD (UNITS)",
+            unit="units",
+            min_val=0,
+            max_val=1500,
+            line_color=COLOR_ACCENT,
+            thresholds=[(1000.0, COLOR_DANGER, "Danger Thresh: > 1000")]
+        )
+        self.chart_weight.grid(row=0, column=0, padx=4, sticky="nsew")
+
+        # Chart 2: Distance History
+        self.chart_distance = TkStripChart(
+            charts_grid,
+            title="DISTANCE / PROXIMITY (CM)",
+            unit="cm",
+            min_val=0,
+            max_val=80,
+            line_color=COLOR_WARN,
+            thresholds=[(20.0, COLOR_DANGER, "Proximity Thresh: < 20 cm")]
+        )
+        self.chart_distance.grid(row=0, column=1, padx=4, sticky="nsew")
+
+        # Chart 3: Accelerometer X History
+        self.chart_accel = TkStripChart(
+            charts_grid,
+            title="ACCELEROMETER X (m/s²)",
+            unit="m/s²",
+            min_val=-15,
+            max_val=15,
+            line_color=COLOR_PURPLE,
+            thresholds=[
+                (7.0, COLOR_DANGER, "+7.0 High"),
+                (-7.0, COLOR_DANGER, "-7.0 Low")
+            ]
+        )
+        self.chart_accel.grid(row=0, column=2, padx=4, sticky="nsew")
+
+        # ----------------------------------------------------------------------
+        # 6. Live Telemetry Packet Log & Stats Bar (Bottom)
+        # ----------------------------------------------------------------------
+        bottom_frame = ctk.CTkFrame(self, fg_color=COLOR_CARD, corner_radius=10, border_width=1, border_color=COLOR_CARD_BORDER, height=75)
+        bottom_frame.pack(fill="x", padx=16, pady=(2, 10))
+
+        # Left: Live packet terminal readout
+        log_box = ctk.CTkFrame(bottom_frame, fg_color="transparent")
+        log_box.pack(side="left", fill="both", expand=True, padx=12, pady=6)
+
+        ctk.CTkLabel(
+            log_box,
+            text="LATEST SERIAL PACKET (Weight,Distance,Accelerometerx,Status):",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=COLOR_TEXT_MUTED
+        ).pack(anchor="w")
+
+        self.latest_raw_label = ctk.CTkLabel(
+            log_box,
+            text="Waiting for serial connection...",
+            font=ctk.CTkFont(family="Courier", size=12, weight="bold"),
+            text_color=COLOR_ACCENT
+        )
+        self.latest_raw_label.pack(anchor="w")
+
+        # Right: Telemetry Counter Stats
+        stats_box = ctk.CTkFrame(bottom_frame, fg_color="transparent")
+        stats_box.pack(side="right", padx=12, pady=6)
+
+        self.stats_lbl = ctk.CTkLabel(
+            stats_box,
+            text="Frames: 0  |  Normal: 0  |  Person Detect: 0  |  Fan Wobble: 0  |  SD Attempt: 0",
+            font=ctk.CTkFont(size=11),
+            text_color=COLOR_TEXT_MUTED
+        )
+        self.stats_lbl.pack(side="right")
+
+    # --------------------------------------------------------------------------
+    # Card Creators
+    # --------------------------------------------------------------------------
+    def _create_parameter_card(self, parent, col, icon, title, unit, init_val, threshold_text, max_gauge):
+        frame = ctk.CTkFrame(
+            parent,
+            fg_color=COLOR_CARD,
+            corner_radius=12,
+            border_width=1,
+            border_color=COLOR_CARD_BORDER
+        )
+        frame.grid(row=0, column=col, padx=4, sticky="nsew")
+
+        # Header Row
+        hdr = ctk.CTkFrame(frame, fg_color="transparent")
+        hdr.pack(fill="x", padx=12, pady=(10, 2))
+
+        ctk.CTkLabel(
+            hdr,
+            text=f"{icon} {title}",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=COLOR_TEXT_MUTED
+        ).pack(side="left")
+
+        status_pill = ctk.CTkLabel(
+            hdr,
+            text="NORMAL",
+            font=ctk.CTkFont(size=9, weight="bold"),
+            text_color=COLOR_NORMAL,
+            fg_color="#0f172a",
+            corner_radius=4,
+            padx=6,
+            pady=2
+        )
+        status_pill.pack(side="right")
+
+        # Value readout
+        val_lbl = ctk.CTkLabel(
+            frame,
+            text=f"{init_val} {unit}".strip(),
+            font=ctk.CTkFont(size=24, weight="bold"),
+            text_color=COLOR_TEXT
+        )
+        val_lbl.pack(anchor="w", padx=12, pady=(2, 2))
+
+        # Progress / Health gauge bar
+        pbar = ctk.CTkProgressBar(frame, height=6, corner_radius=3, fg_color="#334155", progress_color=COLOR_NORMAL)
+        pbar.pack(fill="x", padx=12, pady=4)
+        pbar.set(0.0)
+
+        # Footer Row (Detailed status & Threshold)
+        footer = ctk.CTkFrame(frame, fg_color="transparent")
+        footer.pack(fill="x", padx=12, pady=(2, 8))
+
+        detail_lbl = ctk.CTkLabel(
+            footer,
+            text="STATUS: NORMAL",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=COLOR_NORMAL
+        )
+        detail_lbl.pack(side="left")
+
+        thresh_lbl = ctk.CTkLabel(
+            footer,
+            text=threshold_text,
+            font=ctk.CTkFont(size=9),
+            text_color=COLOR_TEXT_MUTED
+        )
+        thresh_lbl.pack(side="right")
+
+        return {
+            "frame": frame,
+            "status_pill": status_pill,
+            "val_lbl": val_lbl,
+            "unit": unit,
+            "pbar": pbar,
+            "detail_lbl": detail_lbl,
+            "thresh_lbl": thresh_lbl,
+            "max_gauge": max_gauge
+        }
+
+    def _create_status_card(self, parent, col):
+        frame = ctk.CTkFrame(
+            parent,
+            fg_color=COLOR_CARD,
+            corner_radius=12,
+            border_width=1,
+            border_color=COLOR_CARD_BORDER
+        )
+        frame.grid(row=0, column=col, padx=4, sticky="nsew")
+
+        # Header Row
+        hdr = ctk.CTkFrame(frame, fg_color="transparent")
+        hdr.pack(fill="x", padx=12, pady=(10, 2))
+
+        ctk.CTkLabel(
+            hdr,
+            text="🛡️ ARDUINO STATUS",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color=COLOR_TEXT_MUTED
+        ).pack(side="left")
+
+        rx_pill = ctk.CTkLabel(
+            hdr,
+            text="RX: OK",
+            font=ctk.CTkFont(family="Courier", size=9, weight="bold"),
+            text_color=COLOR_ACCENT,
+            fg_color="#0f172a",
+            corner_radius=4,
+            padx=6,
+            pady=2
+        )
+        rx_pill.pack(side="right")
+
+        # Value readout
+        val_lbl = ctk.CTkLabel(
+            frame,
+            text="NORMAL",
+            font=ctk.CTkFont(size=22, weight="bold"),
+            text_color=COLOR_NORMAL
+        )
+        val_lbl.pack(anchor="w", padx=12, pady=(2, 2))
+
+        # Progress / Health gauge bar
+        pbar = ctk.CTkProgressBar(frame, height=6, corner_radius=3, fg_color="#334155", progress_color=COLOR_NORMAL)
+        pbar.pack(fill="x", padx=12, pady=4)
+        pbar.set(1.0)
+
+        # Footer Row
+        footer = ctk.CTkFrame(frame, fg_color="transparent")
+        footer.pack(fill="x", padx=12, pady=(2, 8))
+
+        detail_lbl = ctk.CTkLabel(
+            footer,
+            text="SYSTEM HEALTH: 100%",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            text_color=COLOR_NORMAL
+        )
+        detail_lbl.pack(side="left")
+
+        mode_lbl = ctk.CTkLabel(
+            footer,
+            text="SAFE OPERATIONAL",
+            font=ctk.CTkFont(size=9),
+            text_color=COLOR_TEXT_MUTED
+        )
+        mode_lbl.pack(side="right")
+
+        return {
+            "frame": frame,
+            "rx_pill": rx_pill,
+            "val_lbl": val_lbl,
+            "pbar": pbar,
+            "detail_lbl": detail_lbl,
+            "mode_lbl": mode_lbl
+        }
+
+    # --------------------------------------------------------------------------
+    # Telemetry Ingestion & Periodic UI Updates
+    # --------------------------------------------------------------------------
+    def _on_packet_received_thread(self, packet):
+        w = packet["weight"]
+        d = packet["distance"]
+        ax = packet["accel_x"]
+        st = packet["status"]
+
+        eval_res = RakshaEvaluator.evaluate(w, d, ax, st)
+
+        with self.data_lock:
+            self.latest_packet = packet
+            self.latest_eval = eval_res
+
+            self.stats["total_packets"] += 1
+            diag = eval_res["diagnosis"]
+            if diag == "NORMAL":
+                self.stats["normal"] += 1
+            elif diag == "PERSON_DETECT":
+                self.stats["person_detect"] += 1
+            elif diag == "FAN_ABNORMAL":
+                self.stats["fan_abnormal"] += 1
+            elif diag == "SUICIDE_ATTEMPT":
+                self.stats["SUICIDE_ATTEMPT"] += 1
+
+    def _periodic_gui_tick(self):
+        """Dispatched in Tkinter UI thread to update the cards, banner, and charts."""
+        with self.data_lock:
+            pkt = self.latest_packet
+            res = self.latest_eval
+            self.latest_packet = None  # Consume
+
+        if pkt and res:
+            self._update_cards(pkt, res)
+            self._update_abnormal_breakdown(res)
+            self._update_charts(pkt)
+            self._update_bottom_readout(pkt, res)
+
+        self.after(200, self._periodic_gui_tick)
+
+    def _update_cards(self, pkt, res):
+        w = pkt["weight"]
+        d = pkt["distance"]
+        ax = pkt["accel_x"]
+        st = pkt["status"]
+
+        # ----------------------------------------------------------------------
+        # Card 1: Weight
+        # ----------------------------------------------------------------------
+        self.card_weight["val_lbl"].configure(text=f"{w:.1f} units")
+        gauge_w = min(1.0, max(0.0, w / self.card_weight["max_gauge"]))
+        self.card_weight["pbar"].set(gauge_w)
+
+        if res["is_weight_abnormal"]:
+            # Red Highlight
+            self.card_weight["frame"].configure(border_color=COLOR_DANGER, border_width=2)
+            self.card_weight["val_lbl"].configure(text_color=COLOR_DANGER)
+            self.card_weight["status_pill"].configure(
+                text="ABNORMAL (>1000)", text_color="#ffffff", fg_color=COLOR_DANGER
+            )
+            self.card_weight["pbar"].configure(progress_color=COLOR_DANGER)
+            self.card_weight["detail_lbl"].configure(
+                text="EXCESS LOAD / PULL (>1000)", text_color=COLOR_DANGER
+            )
+        else:
+            # Normal Green
+            self.card_weight["frame"].configure(border_color=COLOR_CARD_BORDER, border_width=1)
+            self.card_weight["val_lbl"].configure(text_color=COLOR_TEXT)
+            self.card_weight["status_pill"].configure(
+                text="NORMAL", text_color=COLOR_NORMAL, fg_color="#0f172a"
+            )
+            self.card_weight["pbar"].configure(progress_color=COLOR_NORMAL)
+            self.card_weight["detail_lbl"].configure(
+                text="STATUS: NORMAL (<=1000)", text_color=COLOR_NORMAL
+            )
+
+        # ----------------------------------------------------------------------
+        # Card 2: Distance
+        # ----------------------------------------------------------------------
+        self.card_distance["val_lbl"].configure(text=f"{d:.1f} cm")
+        gauge_d = min(1.0, max(0.0, d / self.card_distance["max_gauge"]))
+        self.card_distance["pbar"].set(gauge_d)
+
+        if res["is_distance_abnormal"]:
+            # Amber/Red Highlight
+            badge_color = COLOR_DANGER if res["is_weight_abnormal"] else COLOR_WARN
+            self.card_distance["frame"].configure(border_color=badge_color, border_width=2)
+            self.card_distance["val_lbl"].configure(text_color=badge_color)
+            self.card_distance["status_pill"].configure(
+                text="ABNORMAL (<20cm)", text_color="#ffffff", fg_color=badge_color
+            )
+            self.card_distance["pbar"].configure(progress_color=badge_color)
+            self.card_distance["detail_lbl"].configure(
+                text="PROXIMITY DETECTED (<20cm)", text_color=badge_color
+            )
+        else:
+            # Normal Green
+            self.card_distance["frame"].configure(border_color=COLOR_CARD_BORDER, border_width=1)
+            self.card_distance["val_lbl"].configure(text_color=COLOR_TEXT)
+            self.card_distance["status_pill"].configure(
+                text="NORMAL", text_color=COLOR_NORMAL, fg_color="#0f172a"
+            )
+            self.card_distance["pbar"].configure(progress_color=COLOR_NORMAL)
+            self.card_distance["detail_lbl"].configure(
+                text="STATUS: SAFE (>=20cm)", text_color=COLOR_NORMAL
+            )
+
+        # ----------------------------------------------------------------------
+        # Card 3: Accelerometer X
+        # ----------------------------------------------------------------------
+        self.card_accel["val_lbl"].configure(text=f"{ax:+.2f} m/s²")
+        gauge_ax = min(1.0, max(0.0, abs(ax) / self.card_accel["max_gauge"]))
+        self.card_accel["pbar"].set(gauge_ax)
+
+        if res["is_accel_abnormal"]:
+            # Red Highlight
+            self.card_accel["frame"].configure(border_color=COLOR_DANGER, border_width=2)
+            self.card_accel["val_lbl"].configure(text_color=COLOR_DANGER)
+            self.card_accel["status_pill"].configure(
+                text="ABNORMAL (|X|>7)", text_color="#ffffff", fg_color=COLOR_DANGER
+            )
+            self.card_accel["pbar"].configure(progress_color=COLOR_DANGER)
+            self.card_accel["detail_lbl"].configure(
+                text="EXCESS VIBRATION / TILT", text_color=COLOR_DANGER
+            )
+        else:
+            # Normal Green
+            self.card_accel["frame"].configure(border_color=COLOR_CARD_BORDER, border_width=1)
+            self.card_accel["val_lbl"].configure(text_color=COLOR_TEXT)
+            self.card_accel["status_pill"].configure(
+                text="NORMAL", text_color=COLOR_NORMAL, fg_color="#0f172a"
+            )
+            self.card_accel["pbar"].configure(progress_color=COLOR_NORMAL)
+            self.card_accel["detail_lbl"].configure(
+                text="STATUS: STABLE (±7 m/s²)", text_color=COLOR_NORMAL
+            )
+
+        # ----------------------------------------------------------------------
+        # Card 4: Status
+        # ----------------------------------------------------------------------
+        diag = res["diagnosis"]
+        diag_color = res["color"]
+        self.card_status["rx_pill"].configure(text=f"RX: {st}")
+        self.card_status["val_lbl"].configure(text=diag, text_color=diag_color)
+
+        if res["has_abnormal"]:
+            self.card_status["frame"].configure(border_color=diag_color, border_width=2)
+            self.card_status["pbar"].configure(progress_color=diag_color)
+            if diag == "SUICIDE_ATTEMPT":
+                self.card_status["pbar"].set(0.15)
+                self.card_status["detail_lbl"].configure(text="CRITICAL: ATTEMPT DETECTED", text_color=COLOR_DANGER)
+                self.card_status["mode_lbl"].configure(text="EMERGENCY CUTOFF")
+            elif diag == "FAN_ABNORMAL":
+                self.card_status["pbar"].set(0.40)
+                self.card_status["detail_lbl"].configure(text="WARNING: WOBBLE FAULT", text_color=COLOR_DANGER)
+                self.card_status["mode_lbl"].configure(text="MAINTENANCE REQ")
+            elif diag == "PERSON_DETECT":
+                self.card_status["pbar"].set(0.70)
+                self.card_status["detail_lbl"].configure(text="CAUTION: PERSON DETECTED", text_color=COLOR_WARN)
+                self.card_status["mode_lbl"].configure(text="PROXIMITY ACTIVE")
+        else:
+            self.card_status["frame"].configure(border_color=COLOR_CARD_BORDER, border_width=1)
+            self.card_status["pbar"].configure(progress_color=COLOR_NORMAL)
+            self.card_status["pbar"].set(1.0)
+            self.card_status["detail_lbl"].configure(text="SYSTEM HEALTH: 100%", text_color=COLOR_NORMAL)
+            self.card_status["mode_lbl"].configure(text="SAFE OPERATIONAL")
+
+    def _update_abnormal_breakdown(self, res):
+        """Highlights explicitly which values are abnormal."""
+        if res["has_abnormal"]:
+            # One or more parameters abnormal
+            self.diag_panel.configure(
+                border_color=res["color"],
+                border_width=2,
+                fg_color="#18181b"
+            )
+            self.diag_headline.configure(
+                text=f"🚨 {res['headline']}",
+                text_color=res["color"]
+            )
+            self.diag_severity_badge.configure(
+                text=f"ALERT: {res['severity']}",
+                fg_color=res["color"],
+                text_color="#ffffff"
+            )
+
+            # Build human-readable breakdown of WHICH values are abnormal
+            abnormal_items = []
+            for item in res["abnormalities"]:
+                abnormal_items.append(f"• [{item['param'].upper()} ABNORMAL]: Value is {item['current']} (Violates {item['limit']}) — {item['reason']}")
+
+            breakdown_text = "\n".join(abnormal_items)
+            self.abnormal_breakdown_label.configure(
+                text=breakdown_text,
+                text_color="#fecdd3" if res["severity"] == "CRITICAL" else "#fef08a"
+            )
+            self.diag_action_label.configure(
+                text=f"Directive: {res['action']}",
+                text_color=res["color"]
+            )
+        else:
+            # Everything normal
+            self.diag_panel.configure(
+                border_color=COLOR_NORMAL,
+                border_width=1,
+                fg_color=COLOR_CARD
+            )
+            self.diag_headline.configure(
+                text="✔ ALL SENSORS WITHIN SAFE OPERATING THRESHOLDS",
+                text_color=COLOR_NORMAL
+            )
+            self.diag_severity_badge.configure(
+                text="STATUS: NORMAL & SAFE",
+                fg_color=COLOR_NORMAL,
+                text_color="#ffffff"
+            )
+            self.abnormal_breakdown_label.configure(
+                text="No abnormal values detected. Weight <= 1000 units, Distance >= 20 cm, and Accelerometer X within ±7 m/s².",
+                text_color=COLOR_TEXT_MUTED
+            )
+            self.diag_action_label.configure(
+                text="System status: Safe operational mode. Continuous sensor monitoring active.",
+                text_color=COLOR_NORMAL
+            )
+
+    def _update_charts(self, pkt):
+        self.chart_weight.add_point(pkt["weight"])
+        self.chart_distance.add_point(pkt["distance"])
+        self.chart_accel.add_point(pkt["accel_x"])
+
+    def _update_bottom_readout(self, pkt, res):
+        ts = pkt["timestamp"]
+        raw = pkt["raw"]
+        diag = res["diagnosis"]
+        abnormal_names = [a["param"] for a in res["abnormalities"]]
+        abnormal_str = f"ABNORMAL: {', '.join(abnormal_names)}" if abnormal_names else "ALL NORMAL"
+
+        color = res["color"]
+        self.latest_raw_label.configure(
+            text=f"[{ts}] RAW: \"{raw}\"  ➔  [{abnormal_str}]  ➔  DIAGNOSIS: {diag}",
+            text_color=color
+        )
+
+        s = self.stats
+        self.stats_lbl.configure(
+            text=f"Total: {s['total_packets']}  |  Normal: {s['normal']}  |  Person Detect: {s['person_detect']}  |  Fan Wobble: {s['fan_abnormal']}  |  SD Attempt: {s['SUICIDE_ATTEMPT']}"
+        )
+
+    # --------------------------------------------------------------------------
+    # Thread Callbacks & Logging
+    # --------------------------------------------------------------------------
+    def _on_log_thread(self, message, level="INFO"):
+        self.after(0, self._append_log, message, level)
+
+    def _append_log(self, message, level="INFO"):
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        print(f"[{ts}] [{level}] {message}")
+
+    def _on_state_change_thread(self, is_active, status_text):
+        self.after(0, self._update_connection_state_ui, is_active, status_text)
+
+    def _update_connection_state_ui(self, is_active, status_text):
+        if is_active:
+            self.status_badge.configure(
+                text=f"● {status_text.upper()}",
+                text_color="#ffffff",
+                fg_color=COLOR_NORMAL if "Simulation" in status_text else "#2563eb"
+            )
+        else:
+            self.status_badge.configure(
+                text="● SYSTEM DISCONNECTED",
+                text_color=COLOR_TEXT_MUTED,
+                fg_color="#334155"
+            )
+
+    # --------------------------------------------------------------------------
+    # User Action Handlers
+    # --------------------------------------------------------------------------
+    def _refresh_ports(self):
+        ports = SerialManager.get_available_ports()
+        self.port_combo.configure(values=ports)
+        if ports:
+            self.port_combo.set(ports[0])
+        self._append_log(f"Refreshed serial ports list: {ports}", "INFO")
+
+    def _toggle_connection(self):
+        if self.serial_manager.is_connected:
+            self.serial_manager.disconnect()
+            self.connect_btn.configure(text="🔌 Connect Arduino", fg_color="#2563eb")
+        else:
+            port = self.port_combo.get()
+            if not port or "No Ports" in port or "No Serial" in port:
+                messagebox.showwarning(
+                    "Port Selection",
+                    "No valid serial port found.\nPlease plug in your Arduino hardware or click 'Start Simulation' for the Virtual Fan Demo!"
+                )
+                return
+            baud = int(self.baud_combo.get())
+            success, msg = self.serial_manager.connect(port, baud)
+            if success:
+                self.connect_btn.configure(text="⏹ Disconnect", fg_color="#dc2626")
+                if self.serial_manager.is_simulating:
+                    self.sim_btn.configure(text="▶ Start Simulation", fg_color="#059669")
+            else:
+                messagebox.showerror("Connection Failed", f"Could not open serial port {port}:\n{msg}")
+
+    def _toggle_simulation(self):
+        if self.serial_manager.is_simulating:
+            self.serial_manager.stop_simulation()
+            self.sim_btn.configure(text="▶ Start Simulation", fg_color="#059669")
+        else:
+            mode = self.sim_combo.get()
+            self.serial_manager.start_simulation(mode)
+            self.sim_btn.configure(text="⏹ Stop Simulation", fg_color="#dc2626")
+            if self.serial_manager.is_connected:
+                self.connect_btn.configure(text="🔌 Connect Arduino", fg_color="#2563eb")
+
+    def _on_sim_mode_changed(self, mode_name):
+        self.serial_manager.set_simulation_mode(mode_name)
+
+    def _reset_stats(self):
+        for k in self.stats:
+            self.stats[k] = 0
+        s = self.stats
+        self.stats_lbl.configure(
+            text=f"Total: 0  |  Normal: 0  |  Person Detect: 0  |  Fan Wobble: 0  |  SD Attempt: 0"
+        )
+        self._append_log("Telemetry counters reset.", "INFO")
+
+    def _on_close(self):
+        self.serial_manager.disconnect()
+        self.destroy()
+
+
+def main():
+    app = RakshaFanApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
